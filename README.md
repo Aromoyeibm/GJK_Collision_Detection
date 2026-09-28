@@ -21,7 +21,7 @@ a GIF):
 
 ```bash
 python ur3e_cartesian_velocity_mpc.py --meshcat --no-plot \
-  --obstacle-center 0.35 0.24 0.303 \
+  --obstacle-center 0.45 0.13 0.303 \
   --obstacle-radius 0.03 \
   --tool-collision-radius 0.03 \
   --collision-margin 0.04
@@ -50,5 +50,3 @@ python ur3e_cartesian_velocity_mpc.py --hardware --confirm-hardware
 ```
 
 Static-obstacle collision MPC and Meshcat are intentionally simulation-only.
-This controller is not a safety-rated collision-protection system; retain
-independent robot safety limits and procedures.

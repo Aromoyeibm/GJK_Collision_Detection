@@ -48,8 +48,8 @@ class DistanceSample:
     point_obstacle: Array
 
 
-class StaticSphereCollision:
-    """URDF link meshes plus a protective tool sphere against one static sphere.
+class StaticBoxCollision:
+    """URDF link meshes plus a protective tool sphere against one static box.
 
     Coal/HPP-FCL computes the closest witness points.  The returned distance
     gradient is n.T @ J_witness, which is valid while the closest feature does
@@ -60,7 +60,7 @@ class StaticSphereCollision:
         robot: "UR3ePinocchio",
         urdf_path: str,
         center: Array,
-        radius: float,
+        size: Array,
         tool_radius: float,
     ) -> None:
         try:
@@ -69,12 +69,12 @@ class StaticSphereCollision:
             raise RuntimeError(
                 "Static collision checking requires the coal Python package"
             ) from exc
-        if radius <= 0.0 or tool_radius <= 0.0:
-            raise ValueError("Obstacle and tool collision radii must be positive")
+        self.center = np.asarray(center, dtype=float).reshape(3)
+        self.size = np.asarray(size, dtype=float).reshape(3)
+        if np.any(self.size <= 0.0) or tool_radius <= 0.0:
+            raise ValueError("Obstacle side lengths and tool radius must be positive")
 
         self.robot = robot
-        self.center = np.asarray(center, dtype=float).reshape(3)
-        self.radius = float(radius)
         self.tool_radius = float(tool_radius)
         self.geometry_model = pin.buildGeomFromUrdf(
             robot.model, urdf_path, pin.GeometryType.COLLISION
@@ -100,15 +100,16 @@ class StaticSphereCollision:
         )
         tool_gid = self.geometry_model.addGeometryObject(tool_geometry)
         self.robot_geometry_ids.append(tool_gid)
-    ##static sphere obstacle
+        # ``coal.Box`` takes full side lengths, not half-extents.  It is fixed
+        # in the world frame, centred at ``self.center`` and axis aligned.
         obstacle_geometry = pin.GeometryObject(
-            "static_sphere_obstacle",
+            "static_box_obstacle",
             0,
             0,
             pin.SE3(np.eye(3), self.center),
-            coal.Sphere(self.radius),
+            coal.Box(*self.size),
         )
-        #create a collision pair between each robot link and the obstacle sphere
+        # Create a collision pair between each moving robot feature and box.
         self.obstacle_gid = self.geometry_model.addGeometryObject(obstacle_geometry)
         self.pair_ids: list[int] = []
         for robot_gid in self.robot_geometry_ids:
@@ -224,7 +225,7 @@ class MeshcatSimulationViewer:
     def __init__(
         self,
         robot: "UR3ePinocchio",
-        collision: Optional[StaticSphereCollision],
+        collision: Optional[StaticBoxCollision],
         target_position: Array,
     ) -> None:
         import meshcat.geometry as geometry
@@ -271,7 +272,7 @@ class MeshcatSimulationViewer:
         if collision is not None:
             self.obstacle_node = self.viewer["ur3e_mpc/static_obstacle"]
             self.obstacle_node.set_object(
-                geometry.Sphere(collision.radius),
+                geometry.Box(collision.size),
                 geometry.MeshPhongMaterial(
                     color=0xD62728, opacity=0.65, transparent=True
                 ),
@@ -584,7 +585,7 @@ class CartesianTwistMPC:
         dt: float,
         dq_max: Array,
         ddq_max: Array,
-        collision: Optional[StaticSphereCollision] = None,
+        collision: Optional[StaticBoxCollision] = None,
         collision_margin: float = 0.05,
     ) -> None:
         self.robot = robot
@@ -1014,7 +1015,7 @@ def parse_args() -> argparse.Namespace:
         "--delta-position",
         nargs=3,
         type=float,
-        default=[0.1, 0.0, 0.0],
+        default=[0.11, 0.00, 0.0],
         metavar=("DX", "DY", "DZ"),
         help="base/world-frame translation in metres",
     )
@@ -1034,9 +1035,16 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=None,
         metavar=("OX", "OY", "OZ"),
-        help="enable one static world-frame spherical obstacle in simulation",
+        help="enable one static world-frame box obstacle in simulation",
     )
-    parser.add_argument("--obstacle-radius", type=float, default=0.04)
+    parser.add_argument(
+        "--obstacle-size",
+        nargs=3,
+        type=float,
+        default=[0.08, 0.08, 0.08],
+        metavar=("SX", "SY", "SZ"),
+        help="static-box full X/Y/Z side lengths in metres",
+    )
     parser.add_argument(
         "--collision-margin",
         type=float,
@@ -1089,8 +1097,11 @@ def main() -> None:
         raise SystemExit("--save-meshcat-gif requires --meshcat")
     if args.dt <= 0.0 or args.duration <= 0.0 or args.horizon < 1:
         raise ValueError("dt/duration must be positive and horizon >= 1")
-    if args.obstacle_radius <= 0.0 or args.tool_collision_radius <= 0.0:
-        raise ValueError("Obstacle and tool collision radii must be positive")
+    if (
+        np.any(np.asarray(args.obstacle_size) <= 0.0)
+        or args.tool_collision_radius <= 0.0
+    ):
+        raise ValueError("Obstacle side lengths and tool collision radius must be positive")
     if args.collision_margin < 0.0:
         raise ValueError("collision-margin must be non-negative")
 
@@ -1121,17 +1132,17 @@ def main() -> None:
 
     collision = None
     if args.obstacle_center is not None:
-        collision = StaticSphereCollision(
+        collision = StaticBoxCollision(
             robot,
             args.urdf,
             np.asarray(args.obstacle_center, dtype=float),
-            args.obstacle_radius,
+            np.asarray(args.obstacle_size, dtype=float),
             args.tool_collision_radius,
         )
         print(
-            "Static sphere collision checking: "
+            "Static box collision checking: "
             f"center={np.round(collision.center, 4)} m, "
-            f"radius={collision.radius:.3f} m, "
+            f"size={np.round(collision.size, 4)} m, "
             f"margin={args.collision_margin:.3f} m"
         )
         if args.check_collision_gradient:

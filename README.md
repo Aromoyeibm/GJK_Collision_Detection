@@ -34,6 +34,58 @@ values create a cube. `--tool-collision-radius` is the tool sphere radius;
 the obstacle outside the margin at the initial robot pose, otherwise the hard
 QP can be infeasible.
 
+## Detour planning
+
+Add `--plan-detour` to test the direct route and then collision-check simple
+two-waypoint routes around each box face. The shortest valid route becomes the
+MPC reference; the MPC's link/tool clearance constraints stay active while it
+tracks that reference. Orange markers in Meshcat are selected waypoints.
+
+```bash
+python ur3e_cartesian_velocity_mpc.py --meshcat --no-plot \
+  --q0-deg 0 -90 90 -90 -90 0 \
+  --delta-position 0.10 0 0 \
+  --obstacle-center 0.34 0.19 0.303 \
+  --obstacle-size 0.02 0.02 0.02 \
+  --tool-collision-radius 0.02 \
+  --collision-margin 0.02 \
+  --detour-clearance 0 \
+  --plan-detour
+```
+
+`--detour-clearance` is optional extra planning clearance beyond
+`--collision-margin`; it does not replace the hard MPC clearance constraint.
+This is a static-box, simulation-only local planner, not a general global
+planner for arbitrary scenes.
+
+## Configuration-space planning
+
+For a more difficult blocked path, use `--plan-cspace`. It runs a
+bidirectional RRT-Connect planner in the six joint angles. Every sampled joint
+edge is checked against the static box using the same all-link/tool GJK
+clearance model used by MPC. The resulting joint path is converted to a
+Cartesian pose/twist reference for MPC to track.
+
+```bash
+python ur3e_cartesian_velocity_mpc.py --meshcat --no-plot \
+  --q0-deg 0 -90 90 -90 -90 0 \
+  --delta-position 0.10 0 0 \
+  --obstacle-center 0.34 0.19 0.303 \
+  --obstacle-size 0.02 0.02 0.02 \
+  --tool-collision-radius 0.02 \
+  --collision-margin 0.02 \
+  --plan-cspace
+```
+
+The orange dotted line in Meshcat is the planned tool path; it is not a
+safety boundary. `--cspace-max-iterations` and `--cspace-joint-step` tune the
+planner if it cannot find a route. Start and goal configurations must already
+meet the collision margin: no planner can safely end at a target inside the
+obstacle's clearance region.
+
+The green GJK witness spheres default to a 3 mm radius. For smaller markers,
+for example, add `--meshcat-witness-radius 0.0015`.
+
 To save a new GIF (the output folder must already exist):
 
 ```bash

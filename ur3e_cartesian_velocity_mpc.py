@@ -227,6 +227,9 @@ class MeshcatSimulationViewer:
         robot: "UR3ePinocchio",
         collision: Optional[StaticBoxCollision],
         target_position: Array,
+        waypoints: Sequence[Array] = (),
+        planned_path: Optional[Array] = None,
+        witness_radius: float = 0.003,
     ) -> None:
         import meshcat.geometry as geometry
         import meshcat.transformations as transformations
@@ -269,6 +272,32 @@ class MeshcatSimulationViewer:
         self.target_node.set_transform(
             transformations.translation_matrix(self.target_position)
         )
+        self.waypoint_nodes = []
+        for index, waypoint in enumerate(waypoints):
+            node = self.viewer[f"ur3e_mpc/detour_waypoint_{index}"]
+            node.set_object(
+                geometry.Sphere(0.010),
+                geometry.MeshPhongMaterial(color=0xFF7F0E),
+            )
+            node.set_transform(
+                transformations.translation_matrix(
+                    np.asarray(waypoint, dtype=float).reshape(3)
+                )
+            )
+            self.waypoint_nodes.append(node)
+        self.planned_path_node = None
+        if planned_path is not None and len(planned_path) > 1:
+            points = np.asarray(planned_path, dtype=float).reshape(-1, 3)
+            orange = np.tile(
+                np.array([[1.0], [0.498], [0.055]]), (1, len(points))
+            )
+            self.planned_path_node = self.viewer["ur3e_mpc/planned_tool_path"]
+            self.planned_path_node.set_object(
+                geometry.Points(
+                    geometry.PointsGeometry(points.T, orange),
+                    geometry.PointsMaterial(size=0.006, color=0xFF7F0E),
+                )
+            )
         if collision is not None:
             self.obstacle_node = self.viewer["ur3e_mpc/static_obstacle"]
             self.obstacle_node.set_object(
@@ -283,9 +312,11 @@ class MeshcatSimulationViewer:
             marker_material = geometry.MeshPhongMaterial(color=0x2CA02C)
             self.robot_witness_node = self.viewer["ur3e_mpc/witness_robot"]
             self.obstacle_witness_node = self.viewer["ur3e_mpc/witness_obstacle"]
-            self.robot_witness_node.set_object(geometry.Sphere(0.008), marker_material)
+            self.robot_witness_node.set_object(
+                geometry.Sphere(witness_radius), marker_material
+            )
             self.obstacle_witness_node.set_object(
-                geometry.Sphere(0.008), marker_material
+                geometry.Sphere(witness_radius), marker_material
             )
         else:
             self.robot_witness_node = None
@@ -529,6 +560,45 @@ class UR3ePinocchio:
         residual = np.linalg.norm(self.pose_error(self.pose(theta), desired))
         raise RuntimeError(f"Terminal IK did not converge; residual={residual:.3e}")
 
+    def solve_terminal_ik_continuation(
+        self,
+        desired: pin.SE3,
+        seed: Array,
+        max_translation_step: float = 0.02,
+        max_rotation_step: float = 0.15,
+    ) -> Array:
+        """Solve IK through short Cartesian steps, warm-starting each solve.
+
+        This is setup-time planning only; it is never called by the MPC loop.
+        It improves the basin of convergence of the local DLS IK solver but
+        cannot make a geometrically unreachable target reachable.
+        """
+        if max_translation_step <= 0.0 or max_rotation_step <= 0.0:
+            raise ValueError("IK continuation steps must be positive")
+
+        start = self.pose(seed)
+        translation = desired.translation - start.translation
+        rotation_vector = pin.log3(desired.rotation @ start.rotation.T)
+        steps = max(
+            1,
+            int(np.ceil(np.linalg.norm(translation) / max_translation_step)),
+            int(np.ceil(np.linalg.norm(rotation_vector) / max_rotation_step)),
+        )
+        theta = np.asarray(seed, dtype=float).copy()
+        for index in range(1, steps + 1):
+            fraction = index / steps
+            intermediate = pin.SE3(
+                pin.exp3(fraction * rotation_vector) @ start.rotation,
+                start.translation + fraction * translation,
+            )
+            try:
+                theta = self.solve_terminal_ik(intermediate, theta)
+            except RuntimeError as exc:
+                raise RuntimeError(
+                    f"Terminal IK continuation failed at step {index}/{steps}: {exc}"
+                ) from exc
+        return theta
+
 ## Smooth SE(3) reference trajectory generation, 
 # using a quintic polynomial for the position and rotation vector. 
 # The twist is the time derivative of the pose, which is used as a reference for the MPC controller.
@@ -559,6 +629,374 @@ def make_se3_trajectory(
         start.translation + delta_position,
     )
     return times, samples, goal
+
+
+def make_waypoint_se3_trajectory(
+    start: pin.SE3,
+    goal: pin.SE3,
+    waypoints: Sequence[Array],
+    duration: float,
+    dt: float,
+) -> Tuple[Array, list[PoseSample]]:
+    """Create a smooth-stop Cartesian trajectory through position waypoints.
+
+    Each segment uses a quintic position profile and therefore has zero linear
+    velocity at a waypoint.  Orientation follows one smooth interpolation from
+    the initial to final orientation.
+    """
+    positions = [start.translation]
+    positions.extend(np.asarray(point, dtype=float).reshape(3) for point in waypoints)
+    positions.append(goal.translation)
+    lengths = np.asarray(
+        [np.linalg.norm(end - begin) for begin, end in zip(positions[:-1], positions[1:])]
+    )
+    if np.any(lengths < 1.0e-9):
+        raise ValueError("Detour planner produced a zero-length path segment")
+    cumulative = np.concatenate(([0.0], np.cumsum(lengths)))
+    total_length = cumulative[-1]
+    count = int(np.ceil(duration / dt)) + 1
+    times = np.linspace(0.0, duration, count)
+    rotation_vector = pin.log3(goal.rotation @ start.rotation.T)
+
+    samples: list[PoseSample] = []
+    for time_value in times:
+        path_fraction = time_value / duration
+        distance = path_fraction * total_length
+        segment = min(np.searchsorted(cumulative, distance, side="right") - 1, len(lengths) - 1)
+        local_fraction = (distance - cumulative[segment]) / lengths[segment]
+        sigma = 10.0 * local_fraction**3 - 15.0 * local_fraction**4 + 6.0 * local_fraction**5
+        sigma_dot = (
+            30.0 * local_fraction**2
+            - 60.0 * local_fraction**3
+            + 30.0 * local_fraction**4
+        ) * total_length / (duration * lengths[segment])
+        position = positions[segment] + sigma * (positions[segment + 1] - positions[segment])
+        rotation_sigma = 10.0 * path_fraction**3 - 15.0 * path_fraction**4 + 6.0 * path_fraction**5
+        rotation_sigma_dot = (
+            30.0 * path_fraction**2
+            - 60.0 * path_fraction**3
+            + 30.0 * path_fraction**4
+        ) / duration
+        samples.append(
+            PoseSample(
+                position,
+                pin.exp3(rotation_sigma * rotation_vector) @ start.rotation,
+                np.concatenate(
+                    (
+                        sigma_dot * (positions[segment + 1] - positions[segment]),
+                        rotation_sigma_dot * rotation_vector,
+                    )
+                ),
+            )
+        )
+    return times, samples
+
+
+@dataclass(frozen=True)
+class DetourPlan:
+    """A collision-checked task-space route selected for a static box."""
+
+    waypoints: tuple[Array, ...]
+    name: str
+    predicted_minimum_clearance: float
+
+
+@dataclass(frozen=True)
+class ConfigurationSpacePlan:
+    """Collision-free joint path returned by the static-obstacle planner."""
+
+    theta_path: Array
+    predicted_minimum_clearance: float
+
+
+@dataclass
+class _RRTTree:
+    configurations: list[Array]
+    parents: list[int]
+
+    def add(self, configuration: Array, parent: int) -> int:
+        self.configurations.append(np.asarray(configuration, dtype=float).copy())
+        self.parents.append(parent)
+        return len(self.configurations) - 1
+
+    def path_to_root(self, index: int) -> list[Array]:
+        path = []
+        while index >= 0:
+            path.append(self.configurations[index])
+            index = self.parents[index]
+        return path[::-1]
+
+
+def _joint_edge_is_clear(
+    collision: StaticBoxCollision,
+    begin: Array,
+    end: Array,
+    required_clearance: float,
+    max_joint_step: float,
+) -> bool:
+    """Check a straight configuration-space edge at bounded joint intervals."""
+    count = max(1, int(np.ceil(np.max(np.abs(end - begin)) / max_joint_step)))
+    for fraction in np.linspace(0.0, 1.0, count + 1):
+        if collision.minimum_distance(begin + fraction * (end - begin)) < required_clearance:
+            return False
+    return True
+
+
+def plan_static_box_configuration_space(
+    robot: UR3ePinocchio,
+    collision: StaticBoxCollision,
+    theta_initial: Array,
+    theta_goal: Array,
+    collision_margin: float,
+    max_iterations: int,
+    joint_step: float,
+    random_seed: int = 7,
+) -> ConfigurationSpacePlan:
+    """Plan a static-box route in joint space with bidirectional RRT-Connect.
+
+    Nodes and edges are accepted only when every robot link and the protective
+    tool sphere satisfy the GJK clearance.  This is a simulation planner, not
+    a safety-certified motion-planning system.
+    """
+    if max_iterations < 1 or joint_step <= 0.0:
+        raise ValueError("RRT max iterations and joint step must be positive")
+    theta_initial = np.asarray(theta_initial, dtype=float).reshape(6)
+    theta_goal = np.asarray(theta_goal, dtype=float).reshape(6)
+    for label, configuration in (("start", theta_initial), ("goal", theta_goal)):
+        clearance = collision.minimum_distance(configuration)
+        if clearance < collision_margin:
+            raise RuntimeError(
+                f"Configuration-space planning cannot start: {label} clearance is "
+                f"{1e3 * clearance:.1f} mm, below the required "
+                f"{1e3 * collision_margin:.1f} mm. Move the {label} or obstacle."
+            )
+
+    if _joint_edge_is_clear(
+        collision, theta_initial, theta_goal, collision_margin, joint_step
+    ):
+        clearance = min(
+            collision.minimum_distance(theta_initial),
+            collision.minimum_distance(theta_goal),
+        )
+        return ConfigurationSpacePlan(
+            np.vstack((theta_initial, theta_goal)), clearance
+        )
+
+    rng = np.random.default_rng(random_seed)
+    start_tree = _RRTTree([theta_initial.copy()], [-1])
+    goal_tree = _RRTTree([theta_goal.copy()], [-1])
+    # Sampling the full +/-360 degree joint range is needlessly sparse for a
+    # local static-obstacle problem.  Keep a generous corridor around both
+    # endpoints while respecting the URDF limits.
+    sampling_lower = np.maximum(robot.lower, np.minimum(theta_initial, theta_goal) - 1.2)
+    sampling_upper = np.minimum(robot.upper, np.maximum(theta_initial, theta_goal) + 1.2)
+
+    def nearest_index(tree: _RRTTree, target: Array) -> int:
+        distances = [np.linalg.norm(configuration - target) for configuration in tree.configurations]
+        return int(np.argmin(distances))
+
+    def extend(tree: _RRTTree, target: Array) -> tuple[str, int]:
+        near_index = nearest_index(tree, target)
+        near = tree.configurations[near_index]
+        delta = target - near
+        distance = np.linalg.norm(delta)
+        if distance < 1.0e-12:
+            return "reached", near_index
+        candidate = near + min(1.0, joint_step / distance) * delta
+        if not _joint_edge_is_clear(
+            collision, near, candidate, collision_margin, joint_step
+        ):
+            return "trapped", near_index
+        index = tree.add(candidate, near_index)
+        return ("reached" if distance <= joint_step else "advanced"), index
+
+    def connect(tree: _RRTTree, target: Array) -> tuple[str, int]:
+        status, index = extend(tree, target)
+        while status == "advanced":
+            status, index = extend(tree, target)
+        return status, index
+
+    for iteration in range(max_iterations):
+        if iteration % 2 == 0:
+            active_tree, passive_tree = start_tree, goal_tree
+            active_is_start = True
+        else:
+            active_tree, passive_tree = goal_tree, start_tree
+            active_is_start = False
+        sample = rng.uniform(sampling_lower, sampling_upper)
+        status, active_index = extend(active_tree, sample)
+        if status == "trapped":
+            continue
+        status, passive_index = connect(passive_tree, active_tree.configurations[active_index])
+        if status != "reached":
+            continue
+        if active_is_start:
+            start_path = start_tree.path_to_root(active_index)
+            goal_path = goal_tree.path_to_root(passive_index)[::-1]
+        else:
+            start_path = start_tree.path_to_root(passive_index)
+            goal_path = goal_tree.path_to_root(active_index)[::-1]
+        path = np.asarray(start_path + goal_path[1:])
+        clearance = min(collision.minimum_distance(configuration) for configuration in path)
+        return ConfigurationSpacePlan(path, clearance)
+
+    raise RuntimeError(
+        f"RRT-Connect found no collision-free path in {max_iterations} iterations. "
+        "Increase --cspace-max-iterations, change the start/goal, or use a "
+        "less constrained scene."
+    )
+
+
+def make_joint_path_reference(
+    robot: UR3ePinocchio,
+    theta_path: Array,
+    duration: float,
+    dt: float,
+) -> Tuple[Array, list[PoseSample]]:
+    """Convert a planned joint path into an MPC Cartesian pose/twist reference."""
+    theta_path = np.asarray(theta_path, dtype=float)
+    if theta_path.ndim != 2 or theta_path.shape[0] < 2 or theta_path.shape[1] != 6:
+        raise ValueError("Joint path must have shape (at least 2, 6)")
+    lengths = np.linalg.norm(np.diff(theta_path, axis=0), axis=1)
+    if np.any(lengths < 1.0e-9):
+        raise ValueError("Configuration-space planner returned a repeated node")
+    cumulative = np.concatenate(([0.0], np.cumsum(lengths)))
+    count = int(np.ceil(duration / dt)) + 1
+    times = np.linspace(0.0, duration, count)
+    samples: list[PoseSample] = []
+    for time_value in times:
+        distance = (time_value / duration) * cumulative[-1]
+        segment = min(np.searchsorted(cumulative, distance, side="right") - 1, len(lengths) - 1)
+        local_fraction = (distance - cumulative[segment]) / lengths[segment]
+        sigma = 10.0 * local_fraction**3 - 15.0 * local_fraction**4 + 6.0 * local_fraction**5
+        sigma_dot = (
+            30.0 * local_fraction**2
+            - 60.0 * local_fraction**3
+            + 30.0 * local_fraction**4
+        ) * cumulative[-1] / (duration * lengths[segment])
+        theta = theta_path[segment] + sigma * (theta_path[segment + 1] - theta_path[segment])
+        theta_dot = sigma_dot * (theta_path[segment + 1] - theta_path[segment])
+        pose, jacobian = robot.pose_and_jacobian(theta)
+        samples.append(PoseSample(pose.translation, pose.rotation, jacobian @ theta_dot))
+    return times, samples
+
+
+def _evaluate_cartesian_route(
+    robot: UR3ePinocchio,
+    collision: StaticBoxCollision,
+    theta_initial: Array,
+    start: pin.SE3,
+    goal: pin.SE3,
+    waypoints: Sequence[Array],
+    required_clearance: float,
+    samples_per_segment: int = 24,
+) -> Optional[float]:
+    """Return route clearance, or ``None`` when IK/collision validation fails."""
+    segment_count = len(waypoints) + 1
+    _, samples = make_waypoint_se3_trajectory(
+        start,
+        goal,
+        waypoints,
+        duration=1.0,
+        dt=1.0 / (samples_per_segment * segment_count),
+    )
+    theta = np.asarray(theta_initial, dtype=float).copy()
+    minimum_clearance = collision.minimum_distance(theta)
+    if minimum_clearance < required_clearance:
+        return None
+    for sample in samples[1:]:
+        try:
+            theta = robot.solve_terminal_ik(
+                pin.SE3(sample.rotation, sample.position), theta
+            )
+        except RuntimeError:
+            return None
+        minimum_clearance = min(minimum_clearance, collision.minimum_distance(theta))
+        if minimum_clearance < required_clearance:
+            return None
+    return minimum_clearance
+
+
+def plan_static_box_detour(
+    robot: UR3ePinocchio,
+    collision: StaticBoxCollision,
+    theta_initial: Array,
+    start: pin.SE3,
+    goal: pin.SE3,
+    collision_margin: float,
+    extra_clearance: float,
+) -> DetourPlan:
+    """Choose the shortest validated direct or one-waypoint box detour.
+
+    Candidate routes pass beyond a box face using entry and exit waypoints.
+    Every candidate is checked by continuation IK and by the existing all-link
+    GJK distance model; the end-effector path is therefore only a proposal,
+    not the safety test.
+    """
+    if extra_clearance < 0.0:
+        raise ValueError("Detour extra clearance must be non-negative")
+    required_clearance = collision_margin + extra_clearance
+    half_size = 0.5 * collision.size
+    axes = (
+        ("+X", np.array([1.0, 0.0, 0.0])),
+        ("-X", np.array([-1.0, 0.0, 0.0])),
+        ("+Y", np.array([0.0, 1.0, 0.0])),
+        ("-Y", np.array([0.0, -1.0, 0.0])),
+        ("+Z", np.array([0.0, 0.0, 1.0])),
+        ("-Z", np.array([0.0, 0.0, -1.0])),
+    )
+    candidates: list[tuple[str, tuple[Array, ...]]] = [("direct", ())]
+    for name, direction in axes:
+        axis = int(np.flatnonzero(direction)[0])
+        sign = direction[axis]
+        extent = float(half_size[axis])
+        offset = extent + collision.tool_radius + required_clearance
+        face_coordinate = collision.center[axis] + sign * offset
+        entry = start.translation.copy()
+        exit = goal.translation.copy()
+        if sign > 0.0:
+            entry[axis] = max(entry[axis], face_coordinate)
+            exit[axis] = max(exit[axis], face_coordinate)
+        else:
+            entry[axis] = min(entry[axis], face_coordinate)
+            exit[axis] = min(exit[axis], face_coordinate)
+        waypoints: list[Array] = []
+        if np.linalg.norm(entry - start.translation) > 1.0e-9:
+            waypoints.append(entry)
+        previous = waypoints[-1] if waypoints else start.translation
+        if (
+            np.linalg.norm(exit - previous) > 1.0e-9
+            and np.linalg.norm(exit - goal.translation) > 1.0e-9
+        ):
+            waypoints.append(exit)
+        candidates.append((f"via {name} face", tuple(waypoints)))
+
+    feasible: list[tuple[float, DetourPlan]] = []
+    for name, waypoints in candidates:
+        clearance = _evaluate_cartesian_route(
+            robot,
+            collision,
+            theta_initial,
+            start,
+            goal,
+            waypoints,
+            required_clearance,
+        )
+        if clearance is None:
+            continue
+        points = [start.translation, *waypoints, goal.translation]
+        length = sum(
+            np.linalg.norm(end - begin) for begin, end in zip(points[:-1], points[1:])
+        )
+        feasible.append((length, DetourPlan(tuple(waypoints), name, clearance)))
+
+    if not feasible:
+        raise RuntimeError(
+            "No collision-free static-box route was found among direct and "
+            "single-face detours. Change the start/goal, increase --detour-clearance, "
+            "or use a multi-waypoint/configuration-space planner."
+        )
+    return min(feasible, key=lambda candidate: candidate[0])[1]
 
 ###Extract a reference MPC horizon of poses and twists from the trajectory samples.
 def reference_horizon(
@@ -828,8 +1266,8 @@ class CartesianTwistMPC:
                 polishing=False,
                 eps_abs=1.0e-5,
                 eps_rel=1.0e-5,
-                max_iter=400,
-                time_limit=0.02,
+                max_iter=800,
+                time_limit=0.03,
             )
         else:
             self._solver.update(Px=p_values, q=linear, l=lower_bound, u=upper_bound)
@@ -839,8 +1277,20 @@ class CartesianTwistMPC:
         solve_time = time.perf_counter() - start
         logger.info(f"solver status: {result.info.status}, solve time: {solve_time:.3e} s")
         logger.info(f"primal residual: {result.info.prim_res:.3e}, dual residual: {result.info.dual_res:.3e}")
-        if result.info.status != "solved":
+        acceptable_status = result.info.status in {"solved", "solved inaccurate"}
+        residual_limit = 5.0e-5
+        residuals_acceptable = (
+            result.info.prim_res <= residual_limit
+            and result.info.dual_res <= residual_limit
+        )
+        if not acceptable_status or (
+            result.info.status == "solved inaccurate" and not residuals_acceptable
+        ):
             raise RuntimeError(f"MPC failed: {result.info.status}")
+        if result.info.status == "solved inaccurate":
+            logger.warning(
+                f"Accepting solved inaccurate with residuals below {residual_limit:.1e}"
+            )
 
         optimal = np.asarray(result.x).reshape(self.N, 6)
         self.warm_start[:-1] = optimal[1:]
@@ -1015,7 +1465,7 @@ def parse_args() -> argparse.Namespace:
         "--delta-position",
         nargs=3,
         type=float,
-        default=[0.11, 0.00, 0.0],
+        default=[0.10, 0.00, 0.0],
         metavar=("DX", "DY", "DZ"),
         help="base/world-frame translation in metres",
     )
@@ -1058,6 +1508,34 @@ def parse_args() -> argparse.Namespace:
         help="protective sphere radius centred at tool0 [m]",
     )
     parser.add_argument(
+        "--plan-detour",
+        action="store_true",
+        help="plan a collision-checked direct or one-waypoint route around a static box",
+    )
+    parser.add_argument(
+        "--detour-clearance",
+        type=float,
+        default=0.02,
+        help="extra route-planning clearance beyond collision-margin [m]",
+    )
+    parser.add_argument(
+        "--plan-cspace",
+        action="store_true",
+        help="use RRT-Connect joint-space planning around a static box",
+    )
+    parser.add_argument(
+        "--cspace-max-iterations",
+        type=int,
+        default=3000,
+        help="maximum RRT-Connect expansion attempts",
+    )
+    parser.add_argument(
+        "--cspace-joint-step",
+        type=float,
+        default=0.18,
+        help="RRT extension and collision-check joint step [rad]",
+    )
+    parser.add_argument(
         "--check-collision-gradient",
         action="store_true",
         help="compare GJK witness-point gradients with finite differences at q0",
@@ -1066,6 +1544,12 @@ def parse_args() -> argparse.Namespace:
         "--meshcat",
         action="store_true",
         help="show a live, real-time-paced Meshcat simulation viewer",
+    )
+    parser.add_argument(
+        "--meshcat-witness-radius",
+        type=float,
+        default=0.003,
+        help="GJK witness-marker sphere radius in Meshcat [m]",
     )
     parser.add_argument(
         "--save-meshcat-gif",
@@ -1095,6 +1579,12 @@ def main() -> None:
         raise SystemExit("--meshcat is simulation-only; it does not visualise hardware.")
     if args.save_meshcat_gif is not None and not args.meshcat:
         raise SystemExit("--save-meshcat-gif requires --meshcat")
+    if args.plan_detour and args.obstacle_center is None:
+        raise SystemExit("--plan-detour requires --obstacle-center")
+    if args.plan_cspace and args.obstacle_center is None:
+        raise SystemExit("--plan-cspace requires --obstacle-center")
+    if args.plan_detour and args.plan_cspace:
+        raise SystemExit("Choose either --plan-detour or --plan-cspace, not both")
     if args.dt <= 0.0 or args.duration <= 0.0 or args.horizon < 1:
         raise ValueError("dt/duration must be positive and horizon >= 1")
     if (
@@ -1104,6 +1594,12 @@ def main() -> None:
         raise ValueError("Obstacle side lengths and tool collision radius must be positive")
     if args.collision_margin < 0.0:
         raise ValueError("collision-margin must be non-negative")
+    if args.detour_clearance < 0.0:
+        raise ValueError("detour-clearance must be non-negative")
+    if args.cspace_max_iterations < 1 or args.cspace_joint_step <= 0.0:
+        raise ValueError("cspace planner iterations and joint step must be positive")
+    if args.meshcat_witness_radius <= 0.0:
+        raise ValueError("meshcat-witness-radius must be positive")
 
     robot = UR3ePinocchio(args.urdf, args.ee_frame)
     theta_initial = np.deg2rad(np.asarray(args.q0_deg, dtype=float))
@@ -1118,17 +1614,12 @@ def main() -> None:
         del receiver
 
     start_pose = robot.pose(theta_initial)
-    times, samples, goal_pose = make_se3_trajectory(
-        start_pose,
-        np.asarray(args.delta_position),
-        np.asarray(args.delta_rotation),
-        args.duration,
-        args.dt,
+    delta_position = np.asarray(args.delta_position, dtype=float)
+    delta_rotation = np.asarray(args.delta_rotation, dtype=float)
+    goal_pose = pin.SE3(
+        pin.exp3(delta_rotation) @ start_pose.rotation,
+        start_pose.translation + delta_position,
     )
-
-    # REVIEW: the only IK solve in the program is for the final Cartesian pose.
-    theta_terminal = robot.solve_terminal_ik(goal_pose, theta_initial)
-    print("Terminal IK [deg]:", np.round(np.rad2deg(theta_terminal), 3))
 
     collision = None
     if args.obstacle_center is not None:
@@ -1152,6 +1643,62 @@ def main() -> None:
                 f"{max(errors.values()):.3e} m/rad"
             )
 
+    theta_terminal = robot.solve_terminal_ik_continuation(goal_pose, theta_initial)
+    print("Terminal IK [deg]:", np.round(np.rad2deg(theta_terminal), 3))
+
+    detour_plan = None
+    cspace_plan = None
+    if args.plan_cspace:
+        assert collision is not None  # validated above with --obstacle-center
+        cspace_plan = plan_static_box_configuration_space(
+            robot,
+            collision,
+            theta_initial,
+            theta_terminal,
+            args.collision_margin,
+            args.cspace_max_iterations,
+            args.cspace_joint_step,
+        )
+        print(
+            "Configuration-space RRT-Connect route: "
+            f"nodes={len(cspace_plan.theta_path)}; predicted minimum clearance="
+            f"{1e3 * cspace_plan.predicted_minimum_clearance:.1f} mm"
+        )
+        times, samples = make_joint_path_reference(
+            robot, cspace_plan.theta_path, args.duration, args.dt
+        )
+    elif args.plan_detour:
+        assert collision is not None  # validated above with --obstacle-center
+        detour_plan = plan_static_box_detour(
+            robot,
+            collision,
+            theta_initial,
+            start_pose,
+            goal_pose,
+            args.collision_margin,
+            args.detour_clearance,
+        )
+        print(
+            f"Static-box route: {detour_plan.name}; "
+            f"waypoints={len(detour_plan.waypoints)}; predicted minimum clearance="
+            f"{1e3 * detour_plan.predicted_minimum_clearance:.1f} mm"
+        )
+        times, samples = make_waypoint_se3_trajectory(
+            start_pose,
+            goal_pose,
+            detour_plan.waypoints,
+            args.duration,
+            args.dt,
+        )
+    else:
+        times, samples, _ = make_se3_trajectory(
+            start_pose,
+            delta_position,
+            delta_rotation,
+            args.duration,
+            args.dt,
+        )
+
     mpc = CartesianTwistMPC(
         robot=robot,
         horizon=args.horizon,
@@ -1162,7 +1709,18 @@ def main() -> None:
         collision_margin=args.collision_margin,
     )
     viewer = (
-        MeshcatSimulationViewer(robot, collision, goal_pose.translation)
+        MeshcatSimulationViewer(
+            robot,
+            collision,
+            goal_pose.translation,
+            detour_plan.waypoints if detour_plan is not None else (),
+            (
+                np.asarray([sample.position for sample in samples])
+                if cspace_plan is not None
+                else None
+            ),
+            args.meshcat_witness_radius,
+        )
         if args.meshcat
         else None
     )
